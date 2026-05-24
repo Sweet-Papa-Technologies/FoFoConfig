@@ -1,18 +1,19 @@
 #!/bin/sh
-# fofoconfig — thin Hermes launcher with config-task subcommands.
+# fofoconfig — thin launcher. Routes chat/edit/explain through the ACP client
+# (real seeded-interactive sessions with protocol-level diff/confirm gate), and
+# everything else through the appropriate Hermes subcommand or our own scripts.
 # See docs/Requirements-Specs.md §7-§8 and docs/design.plan.md §6.2.
 set -eu
 
 export HERMES_HOME="${HERMES_HOME:-$HOME/.fofoconfig}"
 export HERMES_REDACT_SECRETS=true     # belt-and-braces with config.yaml security.redact_secrets
 
-# Repo dir is baked in by install.sh (sed-replaces @FOFO_REPO_DIR@).
-# We can't compare to the sentinel here because sed would substitute that too,
-# so detect-via-existence instead: if scripts/ isn't where we expect, fall back.
+# Baked at install time. Detect-via-existence fallback so this works in-repo too.
 FOFO_REPO_DIR="@FOFO_REPO_DIR@"
 [ -d "$FOFO_REPO_DIR/scripts" ] || FOFO_REPO_DIR="$HOME/.fofoconfig-src"
+HERMES_VENV_PYTHON="@HERMES_VENV_PYTHON@"
+[ -x "$HERMES_VENV_PYTHON" ] || HERMES_VENV_PYTHON="$HOME/.hermes/hermes-agent/venv/bin/python3"
 
-# Helper: refuse to launch a session if the operator hasn't configured an endpoint yet.
 check_setup() {
   if [ ! -f "$HERMES_HOME/config.yaml" ] || \
      grep -q '^  default: PLEASE_RUN_FOFOCONFIG_SETUP' "$HERMES_HOME/config.yaml" 2>/dev/null; then
@@ -21,49 +22,71 @@ check_setup() {
   fi
 }
 
+check_acp() {
+  if [ ! -x "$HERMES_VENV_PYTHON" ]; then
+    printf '\033[1;31m[fofo]\033[0m Hermes venv python not found at: %s\n' "$HERMES_VENV_PYTHON" >&2
+    printf '       Re-run install.sh to detect the right path, or set HERMES_VENV_PYTHON.\n' >&2
+    exit 3
+  fi
+}
+
+acp_run() {
+  check_setup; check_acp
+  if [ -n "${1:-}" ]; then
+    exec "$HERMES_VENV_PYTHON" "$FOFO_REPO_DIR/scripts/fofoconfig_acp_client.py" --seed "$1"
+  else
+    exec "$HERMES_VENV_PYTHON" "$FOFO_REPO_DIR/scripts/fofoconfig_acp_client.py"
+  fi
+}
+
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 
 case "$cmd" in
   ""|"chat")
-    check_setup
-    exec hermes chat ;;                                       # interactive TUI
+    acp_run "" ;;
   "setup")
     exec "$FOFO_REPO_DIR/scripts/fofoconfig-setup.sh" "$@" ;;
   "resume")
+    # Resume operates at the Hermes session layer (sessions live in $HERMES_HOME/sessions/).
+    # ACP doesn't natively expose the session-list / resume affordance from outside the protocol,
+    # so we hand off to hermes' own --continue / --resume flags for now.
     check_setup
     if [ -n "${1:-}" ]; then exec hermes --resume "$1"
     else exec hermes --continue; fi ;;
   "edit")
-    check_setup
     [ -n "${1:-}" ] || { echo "usage: fofoconfig edit <program-or-path>"; exit 2; }
-    printf '\033[1;34m[fofo]\033[0m Tip: ask me — "edit the configuration for: %s"\n' "$*"
-    exec hermes chat ;;                                       # interactive — confirm gate works
+    acp_run "edit the configuration for: $*" ;;
   "explain")
-    check_setup
     [ -n "${1:-}" ] || { echo "usage: fofoconfig explain <path>"; exit 2; }
-    printf '\033[1;34m[fofo]\033[0m Tip: ask me — "explain this config file: %s"\n' "$*"
-    exec hermes chat ;;
+    acp_run "explain this config file: $*" ;;
   "doctor")
     exec "$FOFO_REPO_DIR/scripts/smoke-tests.sh" ;;
   "-h"|"--help"|"help")
     cat <<'EOF'
-fofoconfig — privacy-first config-file specialist (BYO Gemma 4 endpoint)
+fofoconfig — privacy-first config-file specialist (BYO Gemma 4 endpoint, ACP-driven)
 
 USAGE:
   fofoconfig setup          Configure endpoint URL / model / API key (interactive wizard)
-  fofoconfig                Start interactive TUI
-  fofoconfig edit <prog>    Print a tip, then start interactive TUI (so the confirm gate works)
-  fofoconfig explain <path> Print a tip, then start interactive TUI
-  fofoconfig resume [id]    Resume last session (CLI flag --continue/--resume)
+  fofoconfig                Start interactive ACP session (real seeded launch + protocol-level confirm gate)
+  fofoconfig edit <prog>    Seed: "edit the configuration for: <prog>" and drop into interactive session
+  fofoconfig explain <path> Seed: "explain this config file: <path>"
+  fofoconfig resume [id]    Resume last session (via hermes --continue/--resume)
   fofoconfig doctor         Run step-zero smoke tests against the configured endpoint
 
 FIRST RUN:
   1. fofoconfig setup       # tell FoFoConfig where your Gemma 4 endpoint is
-  2. fofoconfig             # start chatting
+  2. fofoconfig             # start chatting (ACP client opens, agent listens)
 
 ENV:
-  HERMES_HOME  (default: ~/.fofoconfig)
+  HERMES_HOME           (default: ~/.fofoconfig)
+  HERMES_VENV_PYTHON    (default: baked at install time; falls back to ~/.hermes/hermes-agent/venv/bin/python3)
+
+ARCHITECTURE NOTE:
+  chat/edit/explain run through scripts/fofoconfig_acp_client.py, which speaks the Agent Client
+  Protocol (JSON-RPC over stdio) to a spawned `hermes acp` process. File writes go through a
+  client-side diff/confirm gate (the agent's write_text_file callback lands in our code first
+  — we backup, render the unified diff, and ask the operator y/n before writing).
 EOF
     ;;
-  *) check_setup; exec hermes chat ;;
+  *) acp_run "$cmd $*" ;;
 esac

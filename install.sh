@@ -97,13 +97,43 @@ setup_profile() {
   fi
 }
 
-# ---------- Phase 4: Launcher (records SRC_DIR for `fofoconfig doctor`) ----------
+# Locate Hermes' venv Python — needed for the ACP client which depends on the `acp` package
+# that's bundled in Hermes' venv. We parse the hermes launcher script to find its venv path
+# (more reliable than guessing install layout).
+detect_hermes_venv_python() {
+  hermes_path=$(command -v hermes 2>/dev/null) || {
+    warn "hermes not on PATH after install — can't locate venv python."; return 1; }
+  # The hermes launcher script execs ${VENV}/bin/hermes; extract the path and swap to python3.
+  HERMES_VENV_PYTHON=$(grep -oE '"[^"]+/venv/bin/hermes"' "$hermes_path" 2>/dev/null \
+    | head -1 | sed 's|/hermes"|/python3"|' | tr -d '"')
+  if [ -z "$HERMES_VENV_PYTHON" ] || [ ! -x "$HERMES_VENV_PYTHON" ]; then
+    # Fallback: probe the conventional install layout.
+    HERMES_VENV_PYTHON="$HOME/.hermes/hermes-agent/venv/bin/python3"
+  fi
+  if [ ! -x "$HERMES_VENV_PYTHON" ]; then
+    warn "couldn't locate Hermes venv python; ACP client will fall back to the default path at runtime."
+    HERMES_VENV_PYTHON="$HOME/.hermes/hermes-agent/venv/bin/python3"
+    return 1
+  fi
+  # Confirm `acp` is importable from there.
+  if ! "$HERMES_VENV_PYTHON" -c 'import acp' 2>/dev/null; then
+    warn "Hermes venv python found but `acp` package not importable. ACP-mode chat may not work."
+    warn "  Tried: $HERMES_VENV_PYTHON"
+    return 1
+  fi
+  log "Hermes venv python: $HERMES_VENV_PYTHON"
+  return 0
+}
+
+# ---------- Phase 4: Launcher (bakes repo path + Hermes venv python path for ACP) ----------
 install_launcher() {
   target="/usr/local/bin/fofoconfig"
   if ! install -m 0755 /dev/null "$target" 2>/dev/null; then
     target="$HOME/.local/bin/fofoconfig"; mkdir -p "$(dirname "$target")"
   fi
-  sed "s|@FOFO_REPO_DIR@|${SRC_DIR}|g" "${SRC_DIR}/bin/fofoconfig" > "$target"
+  sed -e "s|@FOFO_REPO_DIR@|${SRC_DIR}|g" \
+      -e "s|@HERMES_VENV_PYTHON@|${HERMES_VENV_PYTHON}|g" \
+      "${SRC_DIR}/bin/fofoconfig" > "$target"
   chmod 0755 "$target"
   LAUNCHER_PATH="$target"
   log "Launcher installed: $target"
@@ -132,6 +162,7 @@ parse_args "$@"
 detect_platform
 install_hermes
 setup_profile
+detect_hermes_venv_python || true   # warns; doesn't abort — launcher has a runtime fallback
 install_launcher
 
 if [ "$RUN_SETUP" = "1" ]; then
