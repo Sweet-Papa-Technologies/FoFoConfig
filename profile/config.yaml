@@ -1,0 +1,75 @@
+# FoFoConfig — Hermes config (profile @ $HERMES_HOME)
+# This file is overwritten by install.sh on upgrade.
+# Edit profile/config.yaml in the repo, not this copy.
+# See docs/design.plan.md and docs/Requirements-Specs.md §7 for key-by-key justification.
+
+# === Endpoint config (written by `fofoconfig setup`) ===
+# Run `fofoconfig setup` to fill this in. Until then, the agent has no endpoint and will
+# refuse to do anything useful. The setup wizard verifies your endpoint actually meets
+# Hermes' requirements (reachable, model loads, tool calling fires, context >= 64K,
+# vision capability if F7) before writing this block.
+model:
+  default: PLEASE_RUN_FOFOCONFIG_SETUP
+  provider: custom
+  base_url: http://localhost:11434/v1
+  api_key: ollama
+  api_mode: chat_completions
+# === End endpoint config ===
+
+display:
+  streaming: false                    # F5/F3: deterministic single-shot responses with tool calls.
+                                      # Flip to true ONLY after smoke tests pass under streaming.
+
+# Toolset reduction is the PRIMARY lockdown lever (see Spec §7, design.plan.md §2.1).
+# Built-in toolset names per `hermes tools` help: "use plain names (e.g. web, memory)".
+platform_toolsets:
+  cli:
+    - file                            # read_file, write_file, patch
+    - terminal                        # subject to approvals.mode and Tirith
+    - web                             # web_extract for F2 research
+    - search                          # web_search; activates bundled duckduckgo-search skill
+    - skills                          # skill_manage, skills_list, skill_view  (F2/F4)
+    - todo                            # the agent's internal step tracker
+    - memory                          # MEMORY.md / USER.md
+    # F7 image INPUT in the TUI uses Alt+V clipboard paste with a multimodal model —
+    # no toolset required. Image/video GENERATION tools are deliberately omitted.
+
+# Explicitly NOT enabled: browser, send_message, delegate_task, cronjob,
+# image_generate, video_generate, video_analyze, text_to_speech, x_search, ha_*, MCP.
+
+security:
+  redact_secrets: true                # SH1: default OFF — flip on. Masks API keys, JWTs,
+                                      # DB connection-string passwords, Authorization headers,
+                                      # PEM blocks, env-var assignments in tool output and logs.
+  tirith_enabled: true                # content scanner; auto-installs on first use on mac/linux
+  tirith_fail_open: false             # if Tirith somehow unavailable, BLOCK rather than allow
+  # allow_private_urls: LEAVE UNSET. Only relevant if a tool fetches a localhost/LAN URL.
+
+approvals:
+  mode: manual                        # F5 + F3: dangerous commands always prompt;
+                                      # non-dangerous commands run freely (no positive whitelist exists)
+  timeout: 60                         # seconds
+
+# TOP-LEVEL (not under security:). PRE-APPROVES dangerous patterns — bypasses the gate.
+# Intentionally EMPTY for FoFoConfig: pre-approving anything here weakens security.
+# (See design.plan.md §2.1 — this key is a bypass, NOT a positive whitelist.)
+command_allowlist: []
+
+# Web backend left UNSET. The bundled duckduckgo-search skill auto-activates for
+# web_search when no backend is configured — keyless, zero-setup.
+# Uncomment for SearxNG:
+# web:
+#   search_backend: searxng
+#   extract_backend: parallel
+
+terminal:
+  backend: local                      # S4. Docker backend documented as hardening option in README.
+
+checkpoints:
+  enabled: true                       # F6 layer 1: auto-snapshot before file mutations; /rollback to undo
+  max_snapshots: 20
+
+file_read_max_chars: 200000           # configs can be large; bump from default 100000
+
+skills:
+  config: {}                          # no external_dirs; everything under $HERMES_HOME/skills/

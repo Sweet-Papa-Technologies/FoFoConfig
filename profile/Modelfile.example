@@ -1,0 +1,20 @@
+# Modelfile.example — reference for operators provisioning a local Ollama Gemma 4.
+# `fofoconfig setup` writes a personalized copy of this to $HERMES_HOME/Modelfile.example
+# with your chosen base tag filled in.
+#
+# Why this exists: Hermes refuses any model with <64K runtime context for tool use.
+# Ollama's stock Gemma 4 tags default to 32K (or less), so you typically need a derived
+# tag to bump num_ctx. To use:
+#   ollama create gemma4-fofo -f ~/.fofoconfig/Modelfile.example
+#   fofoconfig setup --model gemma4-fofo:latest --endpoint http://localhost:11434/v1 --api-key ollama
+#
+# Default base: gemma4:e4b-it-q8_0 (12 GB GGUF Q8, Text+Image multimodal). Swap if you want
+# a lighter (e4b-it-q4_K_M, 9.6 GB) or heavier (e4b-it-bf16 16 GB; 26b 18 GB) variant.
+FROM gemma4:e4b-it-q8_0
+
+PARAMETER num_ctx 65536       # Hermes minimum (verified live 2026-05-23 on Hermes v0.14)
+PARAMETER temperature 0.2     # Edit work wants precision over creativity
+
+# Note: there is NO Modelfile parameter to disable Gemma 4 "thinking" — it is opt-in via
+# the <|think|> token in the system prompt. SOUL.md omits that token; for E2B/E4B
+# specifically, E4B emits no empty thought tags when omitted.

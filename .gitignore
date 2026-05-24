@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local Python (if anyone develops adjacent tooling)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Backups created by FoFoConfig itself, if any fixtures end up in the repo
+*.fofobak
+
+# Smoke-test scratch
+scripts/fixtures/*.local.*
+
+# Anything that looks like a real secret never belongs here
+*.env
+*.env.local
+*.env.*.local
+!profile/skills/config-formats/dotenv-files/SKILL.md
+
+# Hermes profile state should never be checked in — it's per-user runtime state
+.fofoconfig/
+.hermes/
