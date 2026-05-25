@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import difflib
+import fnmatch
 import os
 import shutil
 import sys
@@ -69,6 +70,70 @@ def err(msg: str) -> None:
     print(f"{Color.RED}[fofo]{Color.RESET} {msg}", file=sys.stderr, flush=True)
 
 
+# ---------- path policy (Vuln 2 fix from the security review) ----------
+
+# Paths the agent must NOT read or write without an explicit operator override at the agent layer.
+# These are high-value secret stores common on dev machines. The threat model: a prompt-injected
+# agent (via SOUL rule 7's acknowledged risk) could otherwise be told to read ~/.ssh/id_rsa and
+# exfiltrate it via the `web` toolset. Refusing at the protocol boundary closes that loop.
+#
+# Patterns use fnmatch glob syntax. Paths are absolute-resolved before matching.
+_DENY_PATH_PATTERNS: tuple[str, ...] = (
+    # SSH private keys (allow ~/.ssh/config, known_hosts, *.pub — block id_*, *.pem)
+    "*/.ssh/id_*",
+    "*/.ssh/*_rsa",
+    "*/.ssh/*_dsa",
+    "*/.ssh/*_ecdsa",
+    "*/.ssh/*_ed25519",
+    "*/.ssh/*.pem",
+    "*/.ssh/agent.*",
+    # AWS / GCP / Azure credentials
+    "*/.aws/credentials",
+    "*/.aws/sso/cache/*",
+    "*/.config/gcloud/credentials.db",
+    "*/.config/gcloud/application_default_credentials.json",
+    "*/.azure/accessTokens.json",
+    "*/.azure/msal_token_cache.*",
+    # Kubernetes / Docker
+    "*/.kube/config",
+    "*/.docker/config.json",
+    # Browser / CLI auth stores
+    "*/.config/gh/hosts.yml",
+    "*/.config/gh/config.yml",
+    "*/.netrc",
+    "*/.npmrc",
+    "*/.pypirc",
+    "*/.cargo/credentials*",
+    # GPG
+    "*/.gnupg/*.kbx",
+    "*/.gnupg/*.key",
+    "*/.gnupg/private-keys-v1.d/*",
+    # System secret stores (often root-only, but defense-in-depth)
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/sudoers.d/*",
+    "/etc/ssh/ssh_host_*_key",
+    # Password manager / keyring files
+    "*/.password-store/*",
+    "*/.config/keepassxc/*.kdbx",
+    "*/.local/share/keyrings/*",
+)
+
+
+def _check_path_policy(path: Path) -> str | None:
+    """Return None if path is allowed; otherwise return a denial reason string.
+
+    Compared against `_DENY_PATH_PATTERNS` (fnmatch). Operates on the resolved absolute path
+    so symlink-based bypasses don't work. Conservative: when in doubt, allow — the diff/confirm
+    gate at request_permission is the second line of defense for writes.
+    """
+    s = str(path)
+    for pattern in _DENY_PATH_PATTERNS:
+        if fnmatch.fnmatch(s, pattern):
+            return f"path matches deny pattern '{pattern}'"
+    return None
+
+
 # ---------- the client ----------
 
 class FoFoClient(Client):
@@ -80,10 +145,45 @@ class FoFoClient(Client):
         self._tool_titles: dict[str, str] = {}
         # Newline tracking: agent text streams as chunks; we want a clean prompt afterwards.
         self._mid_agent_line = False
+        # Busy spinner: shown when we're awaiting agent activity (between turns / inside tool calls).
+        self._spinner_task: asyncio.Task | None = None
+        self._spinner_label = "thinking"
+
+    # --- spinner (shown when the agent is busy and not producing visible output) ---
+    def start_spinner(self, label: str = "thinking") -> None:
+        if self._spinner_task and not self._spinner_task.done():
+            return
+        self._spinner_label = label
+        self._spinner_task = asyncio.create_task(self._spin())
+
+    def stop_spinner(self) -> None:
+        if self._spinner_task and not self._spinner_task.done():
+            self._spinner_task.cancel()
+        # Erase whatever line the spinner left behind.
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+
+    async def _spin(self) -> None:
+        frames = "|/-\\"
+        i = 0
+        try:
+            while True:
+                sys.stderr.write(
+                    f"\r{Color.DIM}{frames[i % len(frames)]} {self._spinner_label}...{Color.RESET}"
+                )
+                sys.stderr.flush()
+                await asyncio.sleep(0.12)
+                i += 1
+        except asyncio.CancelledError:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+            raise
 
     # --- streaming output ---
     async def session_update(self, session_id: str, update: Any, **_: Any) -> None:  # noqa: ARG002
         """Handle every kind of streaming update from the agent."""
+        # Any update means the agent is producing something — stop the busy spinner.
+        self.stop_spinner()
         kind = type(update).__name__
         if kind == "AgentMessageChunk":
             self._render_block(getattr(update, "content", None), color=None)
@@ -158,13 +258,22 @@ class FoFoClient(Client):
         self, path: str, session_id: str, limit: int | None = None,
         line: int | None = None, **_: Any
     ) -> ReadTextFileResponse:  # noqa: ARG002
-        p = Path(path)
+        p = Path(path).expanduser().resolve()
+        # Path policy gate (security review Vuln 2): refuse known secret-store paths even
+        # though SOUL rule 7 + redactor are the in-prompt defenses. Defense-in-depth.
+        denial = _check_path_policy(p)
+        if denial:
+            warn(f"refused agent read of {p}: {denial}")
+            raise RequestError.invalid_request(
+                f"FoFoConfig refused to read {p}: {denial}. If you need this read, edit "
+                f"scripts/fofoconfig_acp_client.py _DENY_PATH_PATTERNS and re-run."
+            )
         if not p.exists():
-            raise RequestError.invalid_params(f"File not found: {path}")
+            raise RequestError.invalid_params(f"File not found: {p}")
         try:
             content = p.read_text()
         except UnicodeDecodeError:
-            raise RequestError.invalid_params(f"File is not UTF-8 text: {path}")
+            raise RequestError.invalid_params(f"File is not UTF-8 text: {p}")
         # Honor line/limit slicing if provided (ACP spec — agent may request a window).
         if line is not None:
             lines = content.splitlines(keepends=True)
@@ -194,6 +303,14 @@ class FoFoClient(Client):
         v2 backlog: track recent permission grants and double-check by path.
         """
         p = Path(path).expanduser().resolve()
+        # Path policy gate (security review Vuln 2): refuse writes to deny-listed paths.
+        denial = _check_path_policy(p)
+        if denial:
+            warn(f"refused agent write to {p}: {denial}")
+            raise RequestError.invalid_request(
+                f"FoFoConfig refused to write to {p}: {denial}. If you need this write, edit "
+                f"scripts/fofoconfig_acp_client.py _DENY_PATH_PATTERNS and re-run."
+            )
         if self._mid_agent_line:
             print()
             self._mid_agent_line = False
@@ -374,14 +491,28 @@ async def run(seed: str | None, hermes_home: str) -> int:
             return 1
 
         async def send(text: str) -> None:
-            await conn.prompt(session_id=session_id, prompt=[text_block(text)])
-            # Ensure a clean newline after the agent's turn for the next prompt.
-            if client._mid_agent_line:
-                print()
-                client._mid_agent_line = False
+            # Start spinner while the agent is processing. session_update will stop it on
+            # the first chunk; finally below stops it unconditionally if prompt() returns
+            # without any chunks (rare — model errored, network blip).
+            client.start_spinner("agent thinking")
+            try:
+                await conn.prompt(session_id=session_id, prompt=[text_block(text)])
+            finally:
+                client.stop_spinner()
+                if client._mid_agent_line:
+                    print()
+                    client._mid_agent_line = False
+
+        def print_helper() -> None:
+            print(
+                f"{Color.DIM}Commands: /help | /exit | /quit | Ctrl+D to leave."
+                f"  Paste a screenshot with Alt+V (or Ctrl+V with text).{Color.RESET}"
+            )
+
+        print_helper()
 
         if seed:
-            print(f"{Color.BOLD}You:{Color.RESET} {seed}\n")
+            print(f"\n{Color.BOLD}You:{Color.RESET} {seed}")
             try:
                 await send(seed)
             except Exception as e:
@@ -396,8 +527,11 @@ async def run(seed: str | None, hermes_home: str) -> int:
             text = line.strip()
             if not text:
                 continue
-            if text in ("/exit", "/quit"):
+            if text in ("/exit", "/quit", "/q"):
                 break
+            if text in ("/help", "/h", "/?"):
+                print_helper()
+                continue
             try:
                 await send(text)
             except RequestError as e:

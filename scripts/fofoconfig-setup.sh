@@ -153,28 +153,35 @@ prompt_endpoint() {
 }
 
 # SH4 — refuse known cloud LLM endpoints by default.
+# Hostname compared case-insensitively (DNS / TLS SNI / HTTP Host are case-insensitive;
+# `[ = ]` is byte-exact, so without `tr` a bypass like `https://API.OPENAI.COM/v1` would pass).
 check_cloud_blocklist() {
-  host=$(printf '%s' "$ENDPOINT" | sed -E 's|^https?://([^/:]+).*|\1|')
+  host=$(printf '%s' "$ENDPOINT" | sed -E 's|^https?://([^/:]+).*|\1|' | tr '[:upper:]' '[:lower:]')
   for blocked in $CLOUD_BLOCKLIST; do
-    if [ "$host" = "$blocked" ]; then
-      if [ "$OVERRIDE_CLOUD" = "1" ]; then
-        warn "==================================================================="
-        warn "OVERRIDE: pointing FoFoConfig at $host (a known cloud LLM provider)."
-        warn "This breaks the safe-with-secrets guarantee that is the whole reason"
-        warn "this product exists. Only proceed if you know what you're doing"
-        warn "(e.g. self-hosted proxy that happens to use this hostname)."
-        warn "Logging this override to $HERMES_HOME/memories/MEMORY.md."
-        warn "==================================================================="
-        mkdir -p "$HERMES_HOME/memories"
-        {
-          printf '\n## SH4 override (%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          printf 'Operator pointed FoFoConfig at known cloud LLM hostname %s via --i-know-what-im-doing.\n' "$host"
-          printf 'Privacy guarantee is the operator-controlled-inference assumption; that assumption is overridden here.\n'
-        } >> "$HERMES_HOME/memories/MEMORY.md"
-        return 0
-      fi
-      die "Refusing to configure endpoint $host — it's on the cloud-LLM blocklist (SH4). FoFoConfig's safe-with-secrets guarantee depends on operator-controlled inference. If this is actually a self-hosted endpoint that happens to use this hostname (e.g. a corporate LiteLLM proxy), re-run with --i-know-what-im-doing."
-    fi
+    blocked=$(printf '%s' "$blocked" | tr '[:upper:]' '[:lower:]')
+    # Match exact host AND any subdomain of the blocked host (catches *.api.openai.com).
+    case "$host" in
+      "$blocked"|*."$blocked")
+        :  # falls through to the matched-branch below
+        if [ "$OVERRIDE_CLOUD" = "1" ]; then
+          warn "==================================================================="
+          warn "OVERRIDE: pointing FoFoConfig at $host (matches cloud LLM blocklist entry $blocked)."
+          warn "This breaks the safe-with-secrets guarantee that is the whole reason"
+          warn "this product exists. Only proceed if you know what you're doing"
+          warn "(e.g. self-hosted proxy that happens to use this hostname)."
+          warn "Logging this override to $HERMES_HOME/memories/MEMORY.md."
+          warn "==================================================================="
+          mkdir -p "$HERMES_HOME/memories"
+          {
+            printf '\n## SH4 override (%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'Operator pointed FoFoConfig at host %s (matched blocklist entry %s) via --i-know-what-im-doing.\n' "$host" "$blocked"
+            printf 'Privacy guarantee is the operator-controlled-inference assumption; that assumption is overridden here.\n'
+          } >> "$HERMES_HOME/memories/MEMORY.md"
+          return 0
+        fi
+        die "Refusing to configure endpoint $host — matches cloud-LLM blocklist entry $blocked (SH4). FoFoConfig's safe-with-secrets guarantee depends on operator-controlled inference. If this is actually a self-hosted endpoint that happens to use this hostname (e.g. a corporate LiteLLM proxy), re-run with --i-know-what-im-doing."
+        ;;
+    esac
   done
   # Non-loopback hostnames: warn but allow.
   case "$host" in
