@@ -145,45 +145,14 @@ class FoFoClient(Client):
         self._tool_titles: dict[str, str] = {}
         # Newline tracking: agent text streams as chunks; we want a clean prompt afterwards.
         self._mid_agent_line = False
-        # Busy spinner: shown when we're awaiting agent activity (between turns / inside tool calls).
-        self._spinner_task: asyncio.Task | None = None
-        self._spinner_label = "thinking"
-
-    # --- spinner (shown when the agent is busy and not producing visible output) ---
-    def start_spinner(self, label: str = "thinking") -> None:
-        if self._spinner_task and not self._spinner_task.done():
-            return
-        self._spinner_label = label
-        self._spinner_task = asyncio.create_task(self._spin())
-
-    def stop_spinner(self) -> None:
-        if self._spinner_task and not self._spinner_task.done():
-            self._spinner_task.cancel()
-        # Erase whatever line the spinner left behind.
-        sys.stderr.write("\r\033[K")
-        sys.stderr.flush()
-
-    async def _spin(self) -> None:
-        frames = "|/-\\"
-        i = 0
-        try:
-            while True:
-                sys.stderr.write(
-                    f"\r{Color.DIM}{frames[i % len(frames)]} {self._spinner_label}...{Color.RESET}"
-                )
-                sys.stderr.flush()
-                await asyncio.sleep(0.12)
-                i += 1
-        except asyncio.CancelledError:
-            sys.stderr.write("\r\033[K")
-            sys.stderr.flush()
-            raise
+        # (Earlier drafts had a background-task spinner here. Removed: writing \r to stderr
+        # while agent text streamed to stdout caused cursor races — half-erased lines, blank
+        # output, garbled prompts. The streaming text + tool-call markers (▸) are already the
+        # progress indicator. Silent gaps are short and tolerable; UI honesty beats fake motion.)
 
     # --- streaming output ---
     async def session_update(self, session_id: str, update: Any, **_: Any) -> None:  # noqa: ARG002
         """Handle every kind of streaming update from the agent."""
-        # Any update means the agent is producing something — stop the busy spinner.
-        self.stop_spinner()
         kind = type(update).__name__
         if kind == "AgentMessageChunk":
             self._render_block(getattr(update, "content", None), color=None)
@@ -491,28 +460,21 @@ async def run(seed: str | None, hermes_home: str) -> int:
             return 1
 
         async def send(text: str) -> None:
-            # Start spinner while the agent is processing. session_update will stop it on
-            # the first chunk; finally below stops it unconditionally if prompt() returns
-            # without any chunks (rare — model errored, network blip).
-            client.start_spinner("agent thinking")
-            try:
-                await conn.prompt(session_id=session_id, prompt=[text_block(text)])
-            finally:
-                client.stop_spinner()
-                if client._mid_agent_line:
-                    print()
-                    client._mid_agent_line = False
+            await conn.prompt(session_id=session_id, prompt=[text_block(text)])
+            if client._mid_agent_line:
+                print()
+                client._mid_agent_line = False
 
-        def print_helper() -> None:
-            print(
-                f"{Color.DIM}Commands: /help | /exit | /quit | Ctrl+D to leave."
-                f"  Paste a screenshot with Alt+V (or Ctrl+V with text).{Color.RESET}"
-            )
-
-        print_helper()
+        # Compact helper line. We reprint it right before each "You:" prompt so it sits at
+        # the bottom of the scrollback — the streaming-terminal equivalent of a status bar
+        # without needing a real TUI library. (A proper bottom bar would need prompt_toolkit
+        # and a full screen-region rewrite; out of scope for v1.)
+        HELPER = f"{Color.DIM}── /help · /exit · Ctrl+D to leave · Alt+V to paste an image ──{Color.RESET}"
 
         if seed:
-            print(f"\n{Color.BOLD}You:{Color.RESET} {seed}")
+            print()
+            print(HELPER)
+            print(f"{Color.BOLD}You:{Color.RESET} {seed}")
             try:
                 await send(seed)
             except Exception as e:
@@ -520,7 +482,9 @@ async def run(seed: str | None, hermes_home: str) -> int:
 
         while True:
             try:
-                line = await _ainput(f"\n{Color.BOLD}You:{Color.RESET} ")
+                print()
+                print(HELPER)
+                line = await _ainput(f"{Color.BOLD}You:{Color.RESET} ")
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -530,7 +494,8 @@ async def run(seed: str | None, hermes_home: str) -> int:
             if text in ("/exit", "/quit", "/q"):
                 break
             if text in ("/help", "/h", "/?"):
-                print_helper()
+                # Helper is already reprinted on each loop iteration — this just acknowledges.
+                print(f"{Color.DIM}(helper line is reprinted before every prompt above){Color.RESET}")
                 continue
             try:
                 await send(text)
