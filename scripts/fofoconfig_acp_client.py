@@ -70,53 +70,54 @@ def err(msg: str) -> None:
     print(f"{Color.RED}[fofo]{Color.RESET} {msg}", file=sys.stderr, flush=True)
 
 
-# ---------- path policy (Vuln 2 fix from the security review) ----------
-
-# Paths the agent must NOT read or write without an explicit operator override at the agent layer.
-# These are high-value secret stores common on dev machines. The threat model: a prompt-injected
-# agent (via SOUL rule 7's acknowledged risk) could otherwise be told to read ~/.ssh/id_rsa and
-# exfiltrate it via the `web` toolset. Refusing at the protocol boundary closes that loop.
+# ---------- path policy ----------
 #
-# Patterns use fnmatch glob syntax. Paths are absolute-resolved before matching.
+# INTENTIONALLY NARROW. FoFoConfig's core promise is "the config tool you can paste your
+# secrets into" — running against operator-controlled inference, the operator legitimately
+# wants help editing secrets-dense config files: `.aws/credentials`, `.npmrc`, `.pypirc`,
+# `.netrc`, kubeconfig, .docker/config.json, .env files of every flavour. Blocking those
+# would defeat the product. We trust the existing layers for those:
+#   1. operator-controlled inference (your endpoint, your trust)
+#   2. structure-not-values SOUL rule (no values in skills/memory/web)
+#   3. request_permission gate on writes (you see the diff and approve)
+#   4. file-contents-are-data SOUL rule (no acting on embedded instructions)
+#   5. Hermes redactor on log/context paths
+#
+# The deny-list below covers only files that AREN'T config files by any sensible definition:
+# raw cryptographic key material (binary/PEM blobs there's no reason to "edit") and
+# root-only authentication tables.
 _DENY_PATH_PATTERNS: tuple[str, ...] = (
-    # SSH private keys (allow ~/.ssh/config, known_hosts, *.pub — block id_*, *.pem)
-    "*/.ssh/id_*",
+    # SSH private keys — binary/PEM key material, not config
+    "*/.ssh/id_rsa",
+    "*/.ssh/id_dsa",
+    "*/.ssh/id_ecdsa",
+    "*/.ssh/id_ed25519",
     "*/.ssh/*_rsa",
     "*/.ssh/*_dsa",
     "*/.ssh/*_ecdsa",
     "*/.ssh/*_ed25519",
     "*/.ssh/*.pem",
-    "*/.ssh/agent.*",
-    # AWS / GCP / Azure credentials
-    "*/.aws/credentials",
-    "*/.aws/sso/cache/*",
-    "*/.config/gcloud/credentials.db",
-    "*/.config/gcloud/application_default_credentials.json",
-    "*/.azure/accessTokens.json",
-    "*/.azure/msal_token_cache.*",
-    # Kubernetes / Docker
-    "*/.kube/config",
-    "*/.docker/config.json",
-    # Browser / CLI auth stores
-    "*/.config/gh/hosts.yml",
-    "*/.config/gh/config.yml",
-    "*/.netrc",
-    "*/.npmrc",
-    "*/.pypirc",
-    "*/.cargo/credentials*",
-    # GPG
+    # GPG private key material — not user-editable text
+    "*/.gnupg/private-keys-v1.d/*",
     "*/.gnupg/*.kbx",
     "*/.gnupg/*.key",
-    "*/.gnupg/private-keys-v1.d/*",
-    # System secret stores (often root-only, but defense-in-depth)
-    "/etc/shadow",
-    "/etc/sudoers",
-    "/etc/sudoers.d/*",
-    "/etc/ssh/ssh_host_*_key",
-    # Password manager / keyring files
-    "*/.password-store/*",
+    # Password manager encrypted blobs — opaque, never useful to read
+    "*/.password-store/*.gpg",
     "*/.config/keepassxc/*.kdbx",
     "*/.local/share/keyrings/*",
+    # System auth tables — root-only, not user-editable as configs
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/ssh/ssh_host_*_key",
+    # Deliberately ALLOWED (these are config files, editing them is exactly the job):
+    #   ~/.aws/credentials, ~/.aws/config, ~/.aws/sso/cache/*
+    #   ~/.npmrc, ~/.pypirc, ~/.netrc, ~/.cargo/credentials*
+    #   ~/.kube/config, ~/.docker/config.json
+    #   ~/.config/gh/hosts.yml, ~/.config/gh/config.yml
+    #   ~/.config/gcloud/*, ~/.azure/*
+    #   ~/.ssh/config, ~/.ssh/known_hosts, ~/.ssh/authorized_keys, ~/.ssh/*.pub
+    #   /etc/sudoers, /etc/sudoers.d/* (operator should use sudoedit; SOUL nudges, we don't block)
+    #   any .env file
 )
 
 
@@ -124,13 +125,14 @@ def _check_path_policy(path: Path) -> str | None:
     """Return None if path is allowed; otherwise return a denial reason string.
 
     Compared against `_DENY_PATH_PATTERNS` (fnmatch). Operates on the resolved absolute path
-    so symlink-based bypasses don't work. Conservative: when in doubt, allow — the diff/confirm
-    gate at request_permission is the second line of defense for writes.
+    so symlink-based bypasses don't work. **Default is allow** — the deny-list is intentionally
+    narrow per the product's "safe to edit secrets-dense configs" promise. The real protection
+    for writes is the request_permission diff/confirm gate.
     """
     s = str(path)
     for pattern in _DENY_PATH_PATTERNS:
         if fnmatch.fnmatch(s, pattern):
-            return f"path matches deny pattern '{pattern}'"
+            return f"not a config file (matched deny pattern '{pattern}')"
     return None
 
 
